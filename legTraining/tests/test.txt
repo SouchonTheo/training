@@ -1,0 +1,75 @@
+#!./16-complete
+
+if (3 > 4) 111; else 222;
+if (3 < 4) 333; else 444;
+
+x = 0;
+while (x < 5) {
+      print x;
+      x = x + 1;
+}
+
+f = fun (x,y) { x = x + y; x; };
+f(20, 22);
+
+makeCounter = fun(n) { fun () { n = n + 1; }; };
+
+counter = makeCounter(40);
+
+counter();
+counter();
+counter();
+counter();
+
+print undef;
+
+i = 666;
+
+fun test()
+{
+    var i = 0;
+    while (i < 10) {
+      print i;
+      i = i + 1;
+    }
+}
+
+test();
+
+print i;
+
+prim(1, 2, 3, 4);
+
+# i = 1;
+# while (i) i = i + 1;
+
+print 12.34;
+print "hello, world";
+print [1, 2, 3];
+print [1+2, 3+4, "hello", ["woo", "hoo"], test];
+
+print 1+2;
+print 1+2.3;
+print 1.2+3;
+print 1.2+3.4;
+print "hello" + " " + "world";
+
+x = 0;
+while (x < 10) {
+      x = x + 1;
+      if (x == 4) continue;
+      if (x == 8) break;
+      print x;
+}
+
+print 21/7;
+print 22/7;
+
+print 1   < 2;
+print 1.0 < 2;
+print 1   < 2.0;
+print 1.0 < 2.0;
+
+import("16-hellos.txt");
+
+print "that's all folks!";

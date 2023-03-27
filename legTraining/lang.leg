@@ -1,0 +1,1600 @@
+%{
+
+/* DONE:
+   + garbage collection
+   + types: float, string, array/list (add syntax to make constants and overload the '+' operator to work with floats and integers)
+   + break, continue
+   + file names on command line = include source files in program (libraries)
+   + tagged integers
+   Yay! :^)
+ */
+
+#define TAGGED_INTS 1
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+#include <stdarg.h>
+#include <assert.h>
+#include <math.h>
+
+#include <gc.h>
+
+void fatal(char *msg, ...)
+{
+    fprintf(stderr, "\nerror: ");
+    va_list ap;
+    va_start(ap, msg);
+    vfprintf(stderr, msg, ap);
+    va_end(ap);
+    fprintf(stderr, "\n");
+    exit(1);
+}
+
+typedef union Object Object;
+
+typedef enum {
+    Undefined,
+    Primitive,
+    Integer,
+    Float,
+    String,
+    Symbol,
+    List,
+    Closure,    // a Function + its environment
+    Array,
+    MakeArray,
+    Binop,	// binary operator
+    Unyop,	// unary operator
+    Var,	// create variable
+    Assign,	// assignment
+    Print,
+    If,
+    While,
+    Break,
+    Continue,
+    Block,
+    Function,   // creates a Closure when evaluated
+    Call,
+    Return,
+} type_t;
+
+typedef enum {		// binary operators
+    LT, LE, EQ, NE, GE, GT,
+    ADD, SUB, MUL, DIV, MOD,
+} binop_t;
+
+typedef enum {		// unary operators
+    NEG, NOT,
+} unyop_t;
+
+typedef Object *(*prim_t)(int argc, Object **argv);
+
+struct Primitive { type_t _type;  prim_t function;			      };
+struct Integer	 { type_t _type;  int _value;				      }; // value of the integer
+struct Float	 { type_t _type;  float value;				      };
+struct String	 { type_t _type;  char *value;  int size;                     };
+struct Symbol	 { type_t _type;  char *name;  Object *value;                 }; // name of the symbol, variable value
+struct List      { type_t _type;  Object *head, *tail;                        };
+struct Closure   { type_t _type;  Object *function, *environment;             }; // remember env of func
+struct Array     { type_t _type;  Object **elements;  int size, capacity;     }; // elements, current size, maximum size
+struct MakeArray { type_t _type;  Object *elements;			      }; // elements, current size, maximum size
+struct Binop	 { type_t _type;  binop_t op;  Object *lhs, *rhs;	      }; // operation; two operands
+struct Unyop	 { type_t _type;  unyop_t op;  Object *lhs;		      }; // operation; one operand
+struct Var	 { type_t _type;  Object *lhs, *rhs;			      }; // symbol and value to assign
+struct Assign	 { type_t _type;  Object *lhs, *rhs;			      }; // symbol and value to assign
+struct Print	 { type_t _type;  Object *value;			      }; // value to be printed
+struct If	 { type_t _type;  Object *condition, *consequent, *alternate; };
+struct While	 { type_t _type;  Object *condition, *body; 		      };
+struct Break	 { type_t _type;				 	      };
+struct Continue	 { type_t _type;				 	      };
+struct Block	 { type_t _type;  Object **body;  int size; 		      };
+struct Function	 { type_t _type;  Object *parameters, *body, *code;  	      };
+struct Call	 { type_t _type;  Object *function, *arguments;	  	      };
+struct Return	 { type_t _type;  Object *value;	  	    	      };
+
+union Object {
+    type_t	     _type;
+    struct Symbol    Symbol;
+    struct Primitive Primitive;
+    struct Integer   Integer;
+    struct Float     Float;
+    struct String    String;
+    struct List      List;
+    struct Closure   Closure;
+    struct Array     Array;
+    struct MakeArray MakeArray;
+    struct Binop     Binop;
+    struct Unyop     Unyop;
+    struct Var       Var;
+    struct Assign    Assign;
+    struct Print     Print;
+    struct If        If;
+    struct While     While;
+    struct Break     Break;
+    struct Continue  Continue;
+    struct Block     Block;
+    struct Function  Function;
+    struct Call      Call;
+    struct Return    Return;
+};
+
+type_t getType(Object *o)
+{
+    if ((intptr_t)o & 1) return Integer;
+    return o->_type;
+}
+
+Object *checkType(Object *n, type_t type, char *file, int line)
+{
+    if (type != getType(n)) {
+	fprintf(stderr, "\n%s:%d: expected type %d, got type %d\n", file, line, type, getType(n));
+	exit(1);
+    }
+    return n;
+}
+
+#define get(NODE, TYPE, MEMBER)	(checkType(NODE, TYPE, __FILE__, __LINE__)->TYPE.MEMBER)
+
+Object *nil   = 0; // Undefined
+Object *false = 0; // an Integer value 0
+Object *true  = 0; // an Integer value 1
+
+Object *newBoolean(int i) { return i ? true : false; }
+
+#if TAGGED_INTS
+int   getInteger(Object *n) { return (intptr_t)n >> 1; }
+#else
+int   getInteger(Object *n) { return get(n, Integer,_value); }
+#endif
+
+float getFloat  (Object *n) { return get(n, Float,value); }
+int   getBoolean(Object *n) { return getInteger(n); }
+
+Object *newObject(type_t type)
+{
+    Object *n = GC_malloc(sizeof(Object));
+    n->_type = type;
+    return n;
+}
+
+Object *newPrimitive(prim_t function)
+{
+    Object *n = newObject(Primitive);
+    n->Primitive.function = function;
+    return n;
+}
+
+Object *newInteger(int i)
+{
+#if TAGGED_INTS
+    return (Object *)(((intptr_t)i << 1) | 1);
+#else
+    Object *n = newObject(Integer);
+    n->Integer._value = i;
+    return n;
+#endif
+}
+
+Object *newFloat(float f)
+{
+    Object *n = newObject(Float);
+    n->Float.value = f;
+    return n;
+}
+
+Object *newStringSize(char *s, int sz)
+{
+    Object *n = newObject(String);
+    n->String.value = GC_malloc_atomic(sz + 1);
+    n->String.size  = sz;
+    memmove(n->String.value, s, sz);
+    n->String.value[sz] = 0; // C compatibility
+    return n;
+}
+
+Object *newString(char *s)
+{
+    return newStringSize(s, strlen(s));
+}
+
+Object *newSymbol(char *name)
+{
+    Object *n = newObject(Symbol);
+    n->Symbol.name     = strdup(name);
+    n->Symbol.value    = false;
+    return n;
+}
+
+Object *newArray(void)
+{
+    Object *n = newObject(Array);
+    n->Array.elements = 0;
+    n->Array.size     = 0;
+    n->Array.capacity = 0;
+    return n;
+}
+
+Object *Array_get(Object *array, int index)
+{
+    if (index < 0 || index >= get(array, Array,size)) {
+	printf("get: array index out of bounds\n");
+	exit(1);
+    }
+    return get(array, Array,elements)[index];
+}
+
+Object *Array_put(Object *array, int index, Object *value)
+{
+    if (index < 0) {
+	printf("get: array index out of bounds\n");
+	exit(1);
+    }
+    int size = get(array, Array,size);
+    int capacity = get(array, Array,capacity);
+    Object **elements = get(array, Array,elements);
+    if (index >= capacity) { // grow the array to include index
+	capacity = index + 1;
+	elements = GC_realloc(elements, sizeof(*elements) * capacity);
+	get(array, Array,elements) = elements;
+	get(array, Array,capacity) = capacity;
+    }
+    while (size <= index) elements[size++] = nil;
+    get(array, Array,size) = size;
+    return elements[index] = value;
+}
+
+Object *Array_append(Object *array, Object *value)
+{
+    return Array_put(array, get(array, Array,size), value);
+}
+
+#define Array_push(A, V)	Array_append(A, V)
+
+Object *Array_top(Object *array)
+{
+    int size = get(array, Array,size) - 1;
+    Object *result = Array_get(array, size); // get last element
+    return result;
+}
+
+Object *Array_pop(Object *array)
+{
+    int size = get(array, Array,size) - 1;
+    Object *result = Array_get(array, size); // get last element
+    get(array, Array,size) = size; // delete last element
+    return result;
+}
+
+Object *newMakeArray(Object *elements)
+{
+    Object *n = newObject(MakeArray);
+    n->MakeArray.elements = elements;
+    return n;
+}
+
+Object *newClosure(Object *function, Object *environment)
+{
+    Object *n = newObject(Closure);
+    n->Closure.function    = function;
+    n->Closure.environment = environment;
+    return n;
+}
+
+Object *newList(Object *head, Object *tail)
+{
+    Object *n = newObject(List);
+    n->List.head = head;
+    n->List.tail = tail;
+    return n;
+}
+
+Object *reverse(Object *list)	// reverses a list in-place
+{
+    Object *tail = nil;
+    while (getType(list) == List) {
+	Object *head = list;
+	list = get(list, List,tail);
+	get(head, List,tail) = tail;
+	tail = head;
+    }
+    return tail;
+}
+
+Object *newBinop(binop_t op, Object *lhs, Object *rhs)
+{
+    Object *n = newObject(Binop);
+    n->Binop.op  = op;	// operation
+    n->Binop.lhs = lhs;	// left operand
+    n->Binop.rhs = rhs;	// right operand
+    return n;
+}
+
+Object *newUnyop(unyop_t op, Object *lhs)
+{
+    Object *n = newObject(Unyop);
+    n->Unyop.op  = op;	// operation
+    n->Unyop.lhs = lhs;	// operand
+    return n;
+}
+
+Object *newVar(Object *lhs, Object *rhs)
+{								assert(getType(lhs) == Symbol);
+    Object *n = newObject(Var);
+    n->Var.lhs = lhs;	// symbol
+    n->Var.rhs = rhs;	// value
+    return n;
+}
+
+Object *newAssign(Object *lhs, Object *rhs)
+{								assert(getType(lhs) == Symbol);
+    Object *n = newObject(Assign);
+    n->Assign.lhs = lhs;	// symbol
+    n->Assign.rhs = rhs;	// value
+    return n;
+}
+
+Object *newPrint(Object *val)
+{
+    Object *n = newObject(Print);
+    n->Print.value = val;
+    return n;
+}
+
+Object *newIf(Object *condition, Object *consequent, Object *alternate)
+{
+    Object *n = newObject(If);
+    get(n, If,condition)  = condition;
+    get(n, If,consequent) = consequent;
+    get(n, If,alternate)  = alternate;
+    return n;
+}
+
+Object *newWhile(Object *condition, Object *body)
+{
+    Object *n = newObject(While);
+    get(n, While,condition)  = condition;
+    get(n, While,body)       = body;
+    return n;
+}
+
+Object *newBreak(void)
+{
+    return newObject(Break);
+}
+
+Object *newContinue(void)
+{
+    return newObject(Continue);
+}
+
+Object *newBlock(void)
+{
+    Object *n = newObject(Block);
+    get(n, Block,body) = 0;
+    get(n, Block,size) = 0;
+    return n;
+}
+
+void Block_append(Object *block, Object *statement)
+{
+    int size = get(block, Block,size);
+    get(block, Block,body) = GC_realloc(get(block, Block,body), sizeof(Object *) * (size + 1));
+    get(block, Block,body)[size] = statement;
+    get(block, Block,size) = size + 1;
+}
+
+Object *newFunction(Object *params, Object *body)
+{
+    Object *n = newObject(Function);
+    get(n, Function,parameters) = params;
+    get(n, Function,body)       = body;
+    return n;
+}
+
+Object *newCall(Object *function, Object *args)
+{
+    Object *n = newObject(Call);
+    get(n, Call,function)  = function;
+    get(n, Call,arguments) = args;
+    return n;
+}
+
+Object *newReturn(Object *value)
+{
+    Object *n = newObject(Return);
+    get(n, Return,value) = value;
+    return n;
+}
+
+void println(Object *n, int indent)
+{								assert(n != 0);
+    printf("%*s", indent*2, "");
+    switch (getType(n)) {
+	case Undefined: printf("nil\n");					break;
+	case Primitive:	printf("Primitive<%p>\n", n->Primitive.function);	break;
+	case Integer:	printf("%d\n", getInteger(n));				break;
+	case Float:	printf("%f\n", n->Float.value);				break;
+	case String:	printf("%.*s\n", n->String.size, n->String.value);	break;
+	case Symbol:	printf("%s\n", n->Symbol.name);				break;
+	case List: {
+	    printf("List\n");
+	    while (getType(n) == List){
+		println(get(n, List,head), indent+1);
+		n = get(n, List,tail);
+	    }
+	    break;
+	}
+	case Closure:
+	    printf("Closure\n");
+	    println(get(n, Closure,function), indent+1);
+	    break;
+	case Array:
+	    printf("Array (%d/%d)\n", get(n, Array,size), get(n, Array, capacity));
+	    for (int i = 0;  i < get(n, Array,size);  ++i)
+		println(get(n, Array,elements)[i], indent+1);
+	    break;
+	case MakeArray:
+	    printf("MakeArray\n");
+	    println(get(n, MakeArray,elements), indent+1);
+	    break;
+	case Binop: {
+	    switch (n->Binop.op) {
+		case LT:  printf("LT\n");	break;
+		case LE:  printf("LE\n");	break;
+		case EQ:  printf("EQ\n");	break;
+		case NE:  printf("NE\n");	break;
+		case GE:  printf("GE\n");	break;
+		case GT:  printf("GT\n");	break;
+		case ADD: printf("ADD\n");	break;
+		case SUB: printf("SUB\n");	break;
+		case MUL: printf("MUL\n");	break;
+		case DIV: printf("DIV\n");	break;
+		case MOD: printf("MOD\n");	break;
+	    }
+	    println(get(n, Binop,lhs), indent+1);
+	    println(get(n, Binop,rhs), indent+1);
+	    break;
+	}
+	case Unyop: {
+	    switch (n->Unyop.op) {
+		case NEG: printf("NEG\n");	break;
+		case NOT: printf("NOT\n");	break;
+	    }
+	    println(get(n, Unyop,lhs), indent+1);
+	    break;
+	}
+	case Var: {
+	    printf("Var\n");
+	    println(n->Var.lhs, indent + 1);
+	    println(n->Var.rhs, indent + 1);
+	    break;
+	}
+	case Assign: {
+	    printf("Assign\n");
+	    println(n->Assign.lhs, indent + 1);
+	    println(n->Assign.rhs, indent + 1);
+	    break;
+	}
+	case Print: {
+	    printf("Print\n");
+	    println(n->Print.value, indent + 1);
+	    break;
+	}
+	case If: {
+	    printf("If\n");
+	    println(get(n, If,condition),  indent + 1);
+	    println(get(n, If,consequent), indent + 1);
+	    println(get(n, If,alternate),  indent + 1);
+	    break;
+	}
+	case While: {
+	    printf("While\n");
+	    println(get(n, While,condition),  indent + 1);
+	    println(get(n, While,body),       indent + 1);
+	    break;
+	}
+	case Break: {
+	    printf("Break\n");
+	    break;
+	}
+	case Continue: {
+	    printf("Continue\n");
+	    break;
+	}
+	case Block: {
+	    Object **body = get(n, Block,body);
+	    int    size = get(n, Block,size);
+	    printf("Block\n");
+	    for (int i = 0;  i < size;  ++i)
+		println(body[i],  indent + 1);
+	    break;
+	}
+	case Function: {
+	    printf("Function\n");
+	    println(get(n, Function,parameters),  indent + 1);
+	    println(get(n, Function,body),  indent + 1);
+	    break;
+	}
+	case Call: {
+	    printf("Call\n");
+	    println(get(n, Call,function), indent + 1);
+	    println(get(n, Call,arguments), indent + 1);
+	    break;
+	}
+	case Return: {
+	    printf("Return\n");
+	    println(get(n, Return,value), indent + 1);
+	    break;
+	}
+    }
+}
+
+Object **symbols = 0;
+int   nSymbols = 0;
+
+Object *intern(char *name)
+{
+    int lo = 0, hi = nSymbols - 1;
+    while (lo <= hi) {
+	int mi = (lo + hi) / 2;
+	int cmp = strcmp(name, symbols[mi]->Symbol.name);
+	if      (cmp < 0) hi = mi - 1;
+	else if (cmp > 0) lo = mi + 1;
+	else              return symbols[mi];
+    }
+    ++nSymbols;
+    symbols = GC_realloc(symbols, sizeof(Object *) * nSymbols);
+    memmove(symbols + lo + 1, symbols + lo, sizeof(Object *) * (nSymbols - lo - 1));
+    return symbols[lo] = newSymbol(name);
+}
+
+Object *result = 0;
+
+#define YYSTYPE Object *
+
+int lineno = 1;
+
+void expected(char *what, char *where)
+{
+    fprintf(stderr, "\nexpected %s, line %d near: %s\n", what, lineno, where);
+    exit(1);
+}
+
+// We will allocate parser contexts (holding the entire state of the parser)
+// explicitly so that multiple calls to yyparse() from different places (such
+// as the 'import' primitive) do not interfere with each other.  We also add
+// an additional member 'FILE *input' to the parser context so that each
+// context knows which input file it is reading from.
+
+#define YY_CTX_LOCAL 1			// allocate parser contexts explicitly
+#define YY_CTX_MEMBERS FILE *input;	// add a member to the parser context
+
+// the first parameter 'yy' is a pointer to the parser context
+
+#define YY_INPUT(yy, buf, result, max_size)			 \
+{								 \
+    int yyc= getc(yy->input);					 \
+    result= (EOF == yyc) ? 0 : (*(buf)= yyc, 1);		 \
+}
+
+%}
+
+start	= - ( !.				{ result = 0 }
+	    | s:stmt				{ result = s }
+	    | <error>				{ expected("statement", yytext) }
+	    )
+
+error	= ( &. ![\n\r] . )*
+
+stmt	= PRINT e:expr ";"			{ $$ = newPrint(e) }
+     	| IF c:cond s:stmt ( - ELSE t:stmt	{ $$ = newIf(c, s, t) }
+	     	    	   | 	  		{ $$ = newIf(c, s, newInteger(0)) }
+			   )
+	| WHILE c:cond s:stmt			{ $$ = newWhile(c, s) }
+	| BREAK ";"				{ $$ = newBreak() }
+	| CONTINUE ";"				{ $$ = newContinue() }
+	| FUN i:ident p:params s:stmt		{ $$ = newAssign(i, newFunction(p, s)) }
+	| RETURN ";"				{ $$ = newReturn(nil) }
+	| RETURN e:expr ";"			{ $$ = newReturn(e) }
+	| VAR i:ident ";"      			{ $$ = newVar(i, nil) }
+	| VAR i:ident ASSIGN e:expr ";"		{ $$ = newVar(i, e) }
+	| block
+	| e:expr ";"				{ $$ = e }
+	| <error>				{ expected("statement", yytext) }
+
+cond	= LPAR e:expr RPAR			{ $$ = e }
+
+params	= LPAR RPAR				{ $$ = nil }
+	| LPAR i:ident				{ i = newList(i, nil) }
+	       ( COMMA j:ident			{ i = newList(j, i) }
+	       )*  RPAR				{ $$ = reverse(i) }
+
+block	= LBRACE b:mkBlock ( - !RBRACE s:stmt	{ Block_append(b, s) }
+	  		   )* - RBRACE		{ $$ = b }
+
+mkBlock =					{ $$ = newBlock() }
+
+expr	= a:assign			{ $$ = a }
+
+assign	= i:ident ASSIGN a:assign	{ $$ = newAssign(i, a) }
+	| rel
+
+rel	= lhs:add ( LESS   rhs:add	{ lhs = newBinop(LT, lhs, rhs) }
+	  	  | LESSEQ rhs:add	{ lhs = newBinop(LE, lhs, rhs) }
+	  	  | EQUAL  rhs:add	{ lhs = newBinop(EQ, lhs, rhs) }
+	  	  | NEQUAL rhs:add	{ lhs = newBinop(NE, lhs, rhs) }
+	  	  | GRTREQ rhs:add	{ lhs = newBinop(GE, lhs, rhs) }
+	  	  | GRTR   rhs:add	{ lhs = newBinop(GT, lhs, rhs) }
+	  	  )*			{ $$ = lhs }
+
+add	= lhs:mul ( PLUS  rhs:mul	{ lhs = newBinop(ADD, lhs, rhs) }
+	  	  | MINUS rhs:mul	{ lhs = newBinop(SUB, lhs, rhs) }
+	  	  )*			{ $$ = lhs }
+
+mul	= lhs:unary (  STAR  rhs:unary	{ lhs = newBinop(MUL, lhs, rhs) }
+	  	     | SLASH rhs:unary	{ lhs = newBinop(DIV, lhs, rhs) }
+	  	     | PCENT rhs:unary	{ lhs = newBinop(MOD, lhs, rhs) }
+	  	     )*			{ $$ = lhs }
+
+unary   = MINUS lhs:unary		{ $$ = newUnyop(NEG, lhs) }
+	| PLING lhs:unary		{ $$ = newUnyop(NOT, lhs) }
+	| postfix
+
+postfix = v:value ( a:args		{ v = newCall(v, a) }
+		   )*			{ $$ = v }
+
+args	= LPAR RPAR			{ $$ = nil }
+	| LPAR i:expr			{ i = newList(i, nil) }
+	       ( COMMA j:expr		{ i = newList(j, i) }
+	       )*  RPAR			{ $$ = reverse(i) }
+
+value	= LPAR lhs:expr RPAR		{ $$ = lhs }
+	| FUN p:params b:block		{ $$ = newFunction(p, b) }
+	| literal
+	| ident
+
+literal	= float
+	| integer
+	| string
+	| array
+
+ident	= < ALPHA ALNUM* > -		{ $$ = intern(yytext) }
+
+float	= < DIGIT+ "." DIGIT* > -	{ $$ = newFloat(atof(yytext)) }
+	| < DIGIT* "." DIGIT+ > -	{ $$ = newFloat(atof(yytext)) }
+
+integer	= < DIGIT+ > -  		{ $$ = newInteger(atoi(yytext)) }
+
+string	= '"' < (!'"' .)* > '"' -	{ $$ = newString(yytext) }
+
+array	= '[' a:mkArray
+	  ( l:expr			{ Array_append(a, l) }
+	    ( COMMA l:expr		{ Array_append(a, l) }
+	    )* )? ']' -			{ $$ = newMakeArray(a) }
+
+mkArray = 				{ $$ = newArray() }
+
+ALPHA	= [A-Za-z_]
+DIGIT	= [0-9]
+ALNUM	= ALPHA | DIGIT
+
+-	= (space | eol | comment)*
+space	= [ \t]
+eol	= ('\n' '\r'* | '\r' '\n'*)	{ lineno++ }
+comment = "#" (!eol .)*
+
+FUN	= "fun"     !ALNUM -
+RETURN	= "return"  !ALNUM -
+VAR	= "var"     !ALNUM -
+WHILE	= "while"   !ALNUM -
+BREAK	= "break"   !ALNUM -
+CONTINUE= "continue"!ALNUM -
+IF	= "if"      !ALNUM -
+ELSE	= "else"    !ALNUM -
+PRINT	= "print"   !ALNUM -
+ASSIGN	= "="       !"="   -
+EQUAL	= "=="             -
+NEQUAL	= "!="             -
+LESS	= "<"       !"="   -
+LESSEQ	= "<="             -
+GRTR	= ">"       !"="   -
+GRTREQ	= ">="             -
+PLUS	= "+"	           -
+MINUS	= "-"	           -
+STAR	= "*"	           -
+SLASH	= "/"	           -
+PCENT	= "%"	           -
+LPAR	= "("	           -
+RPAR	= ")"	           -
+LBRACE	= "{"	           -
+RBRACE	= "}"	           -
+PLING	= "!"	           -
+COMMA   = ","              -
+
+%%
+;
+
+Object *lookup(Object *key, Object *alist) // find key in alist which is ((key1 . val1) (key2 .val2) ...)
+{
+    while (getType(alist) == List) {
+	Object *ass = get(alist, List,head);
+	if (key == get(ass, List,head))
+	    return ass;
+	alist = get(alist, List,tail);
+    }
+    return nil;
+}
+
+Object *evaluate(Object *n, Object *env);
+
+Object *evlist(Object *list, Object *env)
+{
+    if (list == nil) return nil;
+    Object *val= evaluate(get(list, List,head), env);
+    return newList(val, evlist(get(list, List,tail), env));
+}
+
+Object *pairlist(Object *keys, Object *vals, Object *tail)
+{
+    if (keys == nil) return tail;
+    Object *sym = get(keys, List,head);
+    if (getType(vals) == List) {
+	Object *ass = newList(sym, get(vals, List,head)); // association key -> val
+	return newList(ass, pairlist(get(keys, List,tail), get(vals, List,tail), tail));
+    }
+    Object *ass = newList(sym, nil); // association key -> val
+    return newList(ass, pairlist(get(keys, List,tail), nil, tail));
+}
+
+void typeError2(char *what, int lt, int rt)
+{
+    fatal("cannot %s types %d and %d", what, lt, rt);
+}
+
+int fcmp(float l, float r)
+{
+    if (l < r) return -1;
+    if (l > r) return  1;
+    return 0;
+}
+
+int compare(Object *lhs, Object *rhs)
+{
+    int lt = getType(lhs);
+    int rt = getType(rhs);
+    if (lt == rt) {
+	switch (lt) {
+	    case Integer: return getInteger(lhs) - getInteger(rhs);
+	    case Float:   return fcmp(getFloat(lhs), getFloat(rhs));
+	    case String:  return strcmp(get(lhs, String,value), get(rhs, String,value));
+	}
+    }
+    else {
+	switch (lt) {
+	    case Integer: switch (rt) {
+		case Float:	return fcmp(getInteger(lhs), getFloat  (rhs));
+		default:      	goto error;
+	    }
+	    case Float: switch (rt) {
+		case Integer:	return fcmp(getFloat  (lhs), getInteger(rhs));
+		default: 	goto error;
+	    }
+	}
+    }
+  error:
+    typeError2("compare", lt, rt);
+    return 0;
+}
+
+int equal(Object *lhs, Object *rhs)
+{
+    int lt = getType(lhs);
+    int rt = getType(rhs);
+    if (lt == rt) {
+	switch (lt) {
+	    case Integer: return getInteger(lhs) == getInteger(rhs);
+	    case Float:   return getFloat  (lhs) == getFloat  (rhs);
+	    case String:  return strcmp(get(lhs, String,value), get(rhs, String,value)) == 0;
+	}
+    }
+    else {
+	switch (lt) {
+	    case Integer: switch (rt) {
+		case Float:	return getInteger(lhs) == getFloat  (rhs);
+		default:      	return 0;
+	    }
+	    case Float: switch (rt) {
+		case Integer:	return getFloat  (lhs) == getInteger(rhs);
+		default: 	return 0;
+	    }
+	}
+    }
+    return lhs == rhs; // if all else fails, compare for identically the same object
+}
+
+Object *add(Object *lhs, Object *rhs)
+{
+    int lt = getType(lhs);
+    int rt = getType(rhs);
+    if (lt == rt) {
+	switch (lt) {
+	    case Integer: return newInteger(getInteger(lhs) + getInteger(rhs));
+	    case Float:   return newFloat  (getFloat  (lhs) + getFloat  (rhs));
+	    case String: {
+		int lsz = get(lhs, String,size), rsz = get(rhs, String,size);
+		char buf[lsz + rsz];
+		memmove(buf,     get(lhs, String,value), lsz);
+		memmove(buf+lsz, get(rhs, String,value), rsz);
+		return newStringSize(buf, lsz+rsz);
+	    }
+	}
+    }
+    else {
+	switch (lt) {
+	    case Integer: switch (rt) {
+		case Float:	return newFloat  (getInteger(lhs) + getFloat  (rhs));
+		default:      	goto error;
+	    }
+	    case Float: switch (rt) {
+		case Integer:	return newFloat  (getFloat  (lhs) + getInteger(rhs));
+		default: 	goto error;
+	    }
+	}
+    }
+  error:
+    typeError2("add", lt, rt);
+    return 0;
+}
+
+Object *subtract(Object *lhs, Object *rhs)
+{
+    int lt = getType(lhs);
+    int rt = getType(rhs);
+    if (lt == rt) {
+	switch (lt) {
+	    case Integer: return newInteger(getInteger(lhs) - getInteger(rhs));
+	    case Float:   return newFloat  (getFloat  (lhs) - getFloat  (rhs));
+	}
+    }
+    else {
+	switch (lt) {
+	    case Integer: switch (rt) {
+		case Float:	return newFloat  (getInteger(lhs) - getFloat  (rhs));
+		default:      	goto error;
+	    }
+	    case Float: switch (rt) {
+		case Integer:	return newFloat  (getFloat  (lhs) - getInteger(rhs));
+		default: 	goto error;
+	    }
+	}
+    }
+  error:
+    typeError2("sub", lt, rt);
+    return 0;
+}
+
+Object *multiply(Object *lhs, Object *rhs)
+{
+    int lt = getType(lhs);
+    int rt = getType(rhs);
+    if (lt == rt) {
+	switch (lt) {
+	    case Integer: return newInteger(getInteger(lhs) * getInteger(rhs));
+	    case Float:   return newFloat  (getFloat  (lhs) * getFloat  (rhs));
+	}
+    }
+    else {
+	switch (lt) {
+	    case Integer: switch (rt) {
+		case Float:	return newFloat  (getInteger(lhs) * getFloat  (rhs));
+		default:      	goto error;
+	    }
+	    case Float: switch (rt) {
+		case Integer:	return newFloat  (getFloat  (lhs) * getInteger(rhs));
+		default: 	goto error;
+	    }
+	}
+    }
+  error:
+    typeError2("multiply", lt, rt);
+    return 0;
+}
+
+Object *divide(Object *lhs, Object *rhs)
+{
+    int lt = getType(lhs);
+    int rt = getType(rhs);
+    if (lt == rt) {
+	switch (lt) {
+	    case Integer: {
+		int l = getInteger(lhs), r = getInteger(rhs);
+		if (r == 0) goto zero;
+		int result = l / r;
+		if (result * r == l) return newInteger(result);
+		return newFloat((float)l / r);
+	    }
+	    case Float:{
+		float l = getFloat(lhs), r = getFloat(rhs);
+		if (r == 0.0) goto zero;
+		return newFloat(l / r);
+	    }
+	}
+    }
+    else {
+	switch (lt) {
+	    case Integer: switch (rt) {
+		case Float: {
+		    float r = getFloat(rhs);
+		    if (r == 0.0) goto zero;
+		    return newFloat(getInteger(lhs) / r);
+		}
+		default: goto error;
+	    }
+	    case Float: switch (rt) {
+		case Integer:{
+		    int r = getInteger(rhs);
+		    if (r == 0) goto zero;
+		    return newFloat(getFloat(lhs) / r);
+		}
+		default: goto error;
+	    }
+	}
+    }
+  error:
+    typeError2("divide", lt, rt);
+  zero:
+    fatal("division by zero");
+    return 0;
+}
+
+Object *modulus(Object *lhs, Object *rhs)
+{
+    int lt = getType(lhs);
+    int rt = getType(rhs);
+    if (lt == rt) {
+	switch (lt) {
+	    case Integer: {
+		int l = getInteger(lhs), r = getInteger(rhs);
+		if (r == 0) goto zero;
+		return newInteger(l % r);
+	    }
+	    case Float:{
+		float l = getFloat(lhs), r = getFloat(rhs);
+		if (r == 0.0) goto zero;
+		return newFloat(fmod(l, r));
+	    }
+	}
+    }
+    else {
+	switch (lt) {
+	    case Integer: switch (rt) {
+		case Float: {
+		    float r = getFloat(rhs);
+		    if (r == 0.0) goto zero;
+		    return newFloat(fmod(getInteger(lhs), r));
+		}
+		default: goto error;
+	    }
+	    case Float: switch (rt) {
+		case Integer:{
+		    int r = getInteger(rhs);
+		    if (r == 0) goto zero;
+		    return newFloat(fmod(getFloat(lhs), r));
+		}
+		default: goto error;
+	    }
+	}
+    }
+  error:
+    typeError2("modulus", lt, rt);
+  zero:
+    fatal("modulus division by zero");
+    return 0;
+}
+
+// convert parse tree n into its integer value by executing the operations inside it
+
+Object *evaluate(Object *n, Object *env)
+{								assert(n != 0);
+    switch (getType(n)) {
+	case Undefined:
+	case Primitive:
+	case Integer:
+	case Float:
+	case String:	return n;
+	case Symbol: {
+	    Object *ass = lookup(n, env);
+	    if (getType(ass) == List) return get(ass, List,tail);
+	    return get(n, Symbol,value);
+	}
+	case List:	return n;
+	case Closure:   return n;
+	case Array:     return n;
+	case MakeArray: {
+	    Object *a = newArray(), *elements = get(n, MakeArray,elements), **exprs = get(elements, Array,elements);
+	    int size = get(elements, Array,size);
+	    for (int i = 0;  i < size;  ++i)
+		Array_append(a, evaluate(exprs[i], env));
+	    return a;
+	}
+	case Binop: {
+	    Object *lhs = evaluate(n->Binop.lhs, env);
+	    Object *rhs = evaluate(n->Binop.rhs, env);
+	    switch (n->Binop.op) {
+		case LT:  return newBoolean(compare(lhs, rhs) <  0);
+		case LE:  return newBoolean(compare(lhs, rhs) <= 0);
+		case EQ:  return newBoolean( equal (lhs, rhs)     );
+		case NE:  return newBoolean(!equal (lhs, rhs)     );
+		case GE:  return newBoolean(compare(lhs, rhs) >= 0);
+		case GT:  return newBoolean(compare(lhs, rhs) >  0);
+		case ADD: return add     (lhs, rhs);
+		case SUB: return subtract(lhs, rhs);
+		case MUL: return multiply(lhs, rhs);
+		case DIV: return divide  (lhs, rhs);
+		case MOD: return modulus (lhs, rhs);
+		default:
+		    assert(0);		// FIX ME -- MAKE THE REST OF THE BINARY OPERATORS WORK
+		    abort();
+	    }
+	    break;
+	}
+	case Unyop: {
+	    Object *lhs = evaluate(n->Unyop.lhs, env);
+	    switch (n->Unyop.op) {
+		case NEG: return newInteger(-getInteger(lhs));	break;
+		case NOT: return newBoolean(!getInteger(lhs));	break;
+		default:
+		    assert(0);
+		    abort();
+	    }
+	    break;
+	}
+
+	case Var: { // SYMBOL = EXPRESSION
+	    Object *lhs = get(n, Var,lhs);			assert(getType(lhs) == Symbol);
+	    Object *rhs = evaluate(get(n, Var,rhs), env);
+	    env = newList(newList(lhs, rhs), env);
+	    return rhs;
+	}
+	case Assign: { // SYMBOL = EXPRESSION
+	    Object *lhs = get(n, Assign,lhs);			assert(getType(lhs) == Symbol);
+	    Object *rhs = evaluate(get(n, Assign,rhs), env);
+	    Object *ass = lookup(lhs, env);
+	    if (getType(ass) == List) return get(ass, List,tail) = rhs;
+	    return get(lhs, Symbol,value) = rhs;
+	}
+	case Print: {
+	    Object *val = evaluate(get(n, Print,value), env);
+	    println(val, 0);
+	    return val;
+	}
+	case If: {
+	    return evaluate(get(n, If,condition), env)
+		?  evaluate(get(n, If,consequent), env)
+		:  evaluate(get(n, If,alternate), env);
+	}
+	case While: {
+	    Object *result = false;
+	    while (getBoolean(evaluate(get(n, While,condition), env)))
+		result = evaluate(get(n, While,body), env);
+	    return result;
+	}
+	case Break: {
+	    fatal("break not supported by the interpreter");
+	}
+	case Continue: {
+	    fatal("continue not supported by the interpreter");
+	}
+	case Block: {
+	    Object **body  = get(n, Block,body);
+	    int    size  = get(n, Block,size);
+	    Object *result = false;
+	    for (int i = 0;  i < size;  ++i)
+		result = evaluate(body[i], env);
+	    return result;
+	}
+	case Function: {
+	    return newClosure(n, env);
+	}
+	case Call: {
+	    Object *function = evaluate(get(n, Call,function), env);
+	    if (getType(function) != Closure)
+		fatal("cannot call value of type %d");
+	    Object *fenv   = get(function, Closure,environment);
+	    function     = get(function, Closure,function);
+	    Object *args   = get(n, Call,arguments);
+	    Object *params = get(function, Function,parameters);
+	    args = evlist(args, env);
+	    env  = pairlist(params, args, fenv);
+	    return evaluate(get(function, Function,body), env);
+	}
+	case Return: {
+	    fatal("cannot interpret a return without some special machinery");
+	    break;
+	}
+    }
+    assert(0);
+    return 0;
+}
+
+int isFalse(Object *cond)
+{
+    return (getType(cond) == Integer && getInteger(cond) == 0);
+}
+
+struct Frame
+{
+    Object *env;
+    Object *code;
+    int     pc;
+};
+
+struct Frame callStack[32];
+int csp = 0;
+
+enum {
+    iHALT, iDROP,
+    iVAR, iSET, iGET,
+    iPRINT, iINT, iARRAY, iAPPEND,
+    iADD, iSUB, iMUL, iDIV, iMOD,
+    iLT, iLE, iEQ, iNE, iGE, iGT,
+    iJMP, iJF, iJT,
+    iFUN, iCALL, iRETURN,
+};
+
+Object *execute(Object *code)
+{
+    int pc = 0;
+    Object *stack = newArray();
+    Object *env   = nil;
+    for (;;) {
+	int insn = getInteger(get(code, Array,elements)[pc++]);
+	switch (insn) {
+	    case iHALT:
+		//printf("execution halted [%d]\n", get(stack, Array,size));
+		assert(get(stack, Array,size) == 1);
+		return Array_pop(stack);
+	    case iDROP: {
+		Array_pop(stack);
+		continue;
+	    }
+	    case iVAR: {
+		Object *sym = get(code, Array,elements)[pc++];
+		Object *val = Array_top(stack);
+		Object *ass = newList(sym, val);
+		env = newList(ass, env);
+		continue;
+	    }
+	    case iSET: {
+		Object *sym = get(code, Array,elements)[pc++];
+		Object *val = Array_top(stack);
+		Object *ass = lookup(sym, env);
+		if (getType(ass) == List)
+		    get(ass, List,tail) = val;		// set local variable
+		else
+		    get(sym, Symbol,value) = val;	// set global variable
+		continue;
+	    }
+	    case iGET: {
+		Object *sym = get(code, Array,elements)[pc++];
+		Object *ass = lookup(sym, env);
+		if (getType(ass) == List)
+		    Array_push(stack, get(ass, List,tail));	// local variable value
+		else
+		    Array_push(stack, get(sym, Symbol,value));	// global variable value
+		continue;
+	    }
+	    case iPRINT:
+		println(Array_top(stack), 0);
+		continue;
+	    case iINT: {
+		Object *arg = get(code, Array,elements)[pc++];
+		Array_push(stack, arg);
+		continue;
+	    }
+	    case iARRAY: {
+		Array_push(stack, newArray());
+		continue;
+	    }
+	    case iAPPEND: {
+		Object *elt = Array_pop(stack);
+		Object *arr = Array_top(stack);
+		Array_append(arr, elt);
+		continue;
+	    }
+
+#define BINOP(OP) {				\
+		Object *rhs = Array_pop(stack);	\
+		Object *lhs = Array_pop(stack);	\
+		Object *val = OP(lhs, rhs);	\
+		Array_push(stack, val);		\
+		continue;			\
+	    }
+
+   	    case iADD: BINOP(add);
+   	    case iSUB: BINOP(subtract);
+	    case iMUL: BINOP(multiply);
+	    case iDIV: BINOP(divide);
+	    case iMOD: BINOP(modulus);
+
+#undef BINOP
+
+#define BINOP(OP) {							\
+		Object *rhs = Array_pop(stack);				\
+		Object *lhs = Array_pop(stack);				\
+		Object *val = newBoolean(compare(lhs, rhs) OP 0);	\
+		Array_push(stack, val);					\
+		continue;						\
+	    }
+
+	    case iLT:  BINOP(< );
+	    case iLE:  BINOP(<=);
+	    case iEQ:  Array_push(stack, newBoolean( equal(Array_pop(stack), Array_pop(stack))));  continue;
+	    case iNE:  Array_push(stack, newBoolean(!equal(Array_pop(stack), Array_pop(stack))));  continue;
+	    case iGE:  BINOP(>=);
+	    case iGT:  BINOP(> );
+
+#undef BINOP
+
+	    case iJMP: {
+		Object *arg = get(code, Array,elements)[pc++];
+		int destination = getInteger(arg);
+		pc = destination;
+		continue;
+	    }
+
+	    case iJF: {
+		Object *arg = get(code, Array,elements)[pc++];
+		int destination = getInteger(arg);
+		Object *cond = Array_pop(stack);
+		if (isFalse(cond)) pc = destination;
+		continue;
+	    }
+
+	    case iJT: {
+		Object *arg = get(code, Array,elements)[pc++];
+		int destination = getInteger(arg);
+		Object *cond = Array_pop(stack);
+		if (!isFalse(cond)) pc = destination;
+		continue;
+	    }
+
+	    case iFUN: {
+		Object *fun = get(code, Array,elements)[pc++];
+		Array_push(stack, newClosure(fun, env));
+		continue;
+	    }
+
+	    case iCALL: {
+		Object *oArgs = get(code, Array,elements)[pc++];
+		int     nArgs = getInteger(oArgs);
+		Object *closure = Array_pop(stack);
+		if (getType(closure) == Primitive) {
+		    prim_t function = closure->Primitive.function;
+		    Object *result = function(nArgs, stack->Array.elements + stack->Array.size - nArgs);
+		    stack->Array.size -= nArgs;
+		    Array_push(stack, result);
+		    continue;
+		}
+		Object *fun = get(closure, Closure,function);
+		callStack[csp++] = (struct Frame){ env, code, pc };
+		env  = get(closure, Closure,environment);
+		code = get(fun, Function,code);
+		pc   = 0;
+		Object *params = get(fun, Function,parameters);
+		while (getType(params) == List) {
+		    Object *sym = get(params, List,head);
+		    Object *val = nil;
+		    if (nArgs > 0) {
+			val = Array_pop(stack);
+			--nArgs;
+		    }
+		    Object *ass = newList(sym, val);
+		    env = newList(ass, env);
+		    params = get(params, List,tail);
+		}
+		while (nArgs-- > 0) Array_pop(stack);
+		continue;
+	    }
+
+	    case iRETURN: {
+		--csp;
+		env  = callStack[csp].env;
+		code = callStack[csp].code;
+		pc   = callStack[csp].pc;
+		continue;
+	    }
+
+	    default:
+		printf("Please teach me how to execute instruction %d\n", insn);
+		exit(1);
+	}
+    }
+}
+
+void emitL(Object *code, Object *literal) // emit a literal on the program code
+{
+    Array_append(code, literal);
+}
+
+void emitI(Object *code, int insn) // emit an instruction on the program code
+{
+    emitL(code, newInteger(insn));
+}
+
+void emitIL(Object *code, int insn, Object *literal) // emit an instruction and a literal
+{
+    emitI(code, insn);
+    emitL(code, literal);
+}
+
+void emitII(Object *code, int insn, int arg) // emit an instruction and a integer literal
+{
+    emitIL(code, insn, newInteger(arg));
+}
+
+Object *breaks    = 0;
+Object *continues = 0;
+
+void emit(Object *code, Object *n) // emit on code insns for executing n
+{
+    switch (getType(n)) {
+	case Primitive:
+	case Integer:
+	case Float:
+	case String:
+	case Array: {
+	    emitIL(code, iINT, n);
+	    break;
+	}
+	case MakeArray: {
+	    Object *elements = get(n, MakeArray,elements), **exprs = get(elements, Array,elements);
+	    int size = get(elements, Array,size);
+	    emitI(code, iARRAY);
+	    for (int i = 0;  i < size;  ++i) {
+		emit (code, exprs[i]);
+		emitI(code, iAPPEND);
+	    }
+	    break;
+	}
+	case Symbol: {
+	    emitIL(code, iGET, n);
+	    break;
+	}
+	case Binop: {
+	    emit(code, n->Binop.lhs); // recusively compile the operands
+	    emit(code, n->Binop.rhs);
+	    switch (n->Binop.op) {
+		case ADD: emitI(code, iADD); break;
+		case SUB: emitI(code, iSUB); break;
+		case MUL: emitI(code, iMUL); break;
+		case DIV: emitI(code, iDIV); break;
+		case MOD: emitI(code, iMOD); break;
+		case LT:  emitI(code, iLT ); break;
+		case LE:  emitI(code, iLE ); break;
+		case EQ:  emitI(code, iEQ ); break;
+		case NE:  emitI(code, iNE ); break;
+		case GE:  emitI(code, iGE ); break;
+		case GT:  emitI(code, iGT ); break;
+		default:
+		    printf("cannot compile binop\n");
+		    exit(1);
+	    }
+	    break;
+	}
+
+	case Var: {  // sym = exp;
+	    Object *sym = get(n, Var, lhs);
+	    Object *exp = get(n, Var, rhs);
+	    emit(code, exp); // value to assign is on top of stack
+	    emitIL(code, iVAR, sym);
+	    break;
+	}
+
+	case Assign: {  // sym = exp;
+	    Object *sym = get(n, Assign, lhs);
+	    Object *exp = get(n, Assign, rhs);
+	    emit(code, exp); // value to assign is on top of stack
+	    emitIL(code, iSET, sym);
+	    break;
+	}
+
+	case Print: {
+	    emit(code, get(n, Print,value)); // recursively compile the value
+	    emitI(code, iPRINT);
+	    break;
+	}
+
+#define CURPC 		get(code, Array,size)
+#define LABEL(L)	int L = CURPC
+#define PATCHTO(L,D)	get(code, Array,elements)[L+1] = newInteger(D)
+#define PATCH(L)	PATCHTO(L, CURPC)
+
+	case If: {
+	    			emit  (code, get(n, If,condition));
+	    LABEL(jElse);	emitII(code, iJF, 0);
+	    			emit  (code, get(n, If,consequent));
+	    LABEL(jDone);	emitII(code, iJMP, 0);
+	    PATCH(jElse);	emit  (code, get(n, If,alternate));
+	    PATCH(jDone);
+	    break;
+	}
+
+	case While: {
+	    int nBreaks = get(breaks,    Array,size);
+	    int nConts  = get(continues, Array,size);
+	    			emitIL(code, iINT, false);
+	    LABEL(jCond);	emitII(code, iJMP, 0);
+	    LABEL(again);	emitI (code, iDROP);
+				emit  (code, get(n, While,body));
+	    PATCH(jCond);	emit  (code, get(n, While,condition));
+				emitII(code, iJT, again);
+	    while (get(breaks, Array,size) > nBreaks) {
+		int jBreak = getInteger(Array_pop(breaks));
+		PATCH(jBreak);
+	    }
+	    while (get(continues, Array,size) > nConts) {
+		int jCont = getInteger(Array_pop(continues));
+		PATCHTO(jCont, jCond);
+	    }
+	    break;
+	}
+
+	case Break: {
+	    			emitIL(code, iINT, false);
+	    LABEL(jBreak);	emitII(code, iJMP, 0);
+	    Array_append(breaks, newInteger(jBreak));
+	    break;
+	}
+
+	case Continue: {
+	    			emitIL(code, iINT, false);
+	    LABEL(jCont);	emitII(code, iJMP, 0);
+	    Array_append(continues, newInteger(jCont));
+	    break;
+	}
+
+	case Block: {
+	    Object **body = get(n, Block,body);
+	    int      size = get(n, Block,size);
+	    emitIL(code, iINT, false);
+	    for (int i = 0;  i < size;  ++i) {
+		emitI(code, iDROP);
+		emit(code, body[i]);
+	    }
+	    break;
+	}
+
+	case Function: {
+	    int nBreaks = get(breaks,    Array,size);
+	    int nConts  = get(continues, Array,size);
+	    Object *fcode = newArray();
+	    emit (fcode, get(n, Function,body));
+	    emitI(fcode, iRETURN);
+	    if (nBreaks != get(breaks,    Array,size)) fatal("break outside loop");
+	    if (nConts  != get(continues, Array,size)) fatal("continue outside loop");
+	    get(n, Function,code) = fcode;
+	    emitIL(code, iFUN, n);
+	    break;
+	}
+
+	case Call: {
+	    Object *fun = get(n, Call,function);
+	    Object *args = reverse(get(n, Call,arguments));
+	    int nArgs = 0;
+	    while (getType(args) == List) {
+		Object *arg = get(args, List,head);
+		emit(code, arg); // compile each argument expression
+		++nArgs;
+		args = get(args, List,tail);
+	    }
+	    emit  (code, fun); // closure is on top of stack
+	    emitIL(code, iCALL, newInteger(nArgs));
+	    break;
+	}
+
+	case Return: {
+	    Object *val = get(n, Return,value);
+	    emit (code, val);
+	    emitI(code, iRETURN);
+	    break;
+	}
+
+	default:
+	    printf("Please teach me how to compile this:\n");
+	    println(n, 1);
+	    exit(1);
+    }
+}
+
+Object *compile(Object *ast)
+{
+    assert(0 == get(breaks,    Array,size));
+    assert(0 == get(continues, Array,size));
+    Object *code = newArray();
+    emit (code, ast);
+    emitI(code, iHALT);
+    if (0 != get(breaks,    Array,size)) fatal("break outside loop");
+    if (0 != get(continues, Array,size)) fatal("continue outside loop");
+    return code;
+}
+
+int opt_v = 0;
+
+Object *runFile(FILE *file, char *name)
+{
+    yycontext ctx = { 0, 0 }; // local context so that parser is re-entrant
+    ctx.input = file;
+    Object *value = nil;
+    while (yyparse(&ctx) && result) {
+	if (opt_v > 0) println(result, 0);
+	//Object *value = evaluate(result, nil);
+	Object *program = compile(result);
+	if (opt_v > 1) println(program, 0);
+	value = execute(program);
+	if (opt_v > 0) {
+	    printf("==> ");
+	    println(value, 0);
+	}
+    }
+    return value;
+}
+
+Object *runPath(char *path)
+{
+    FILE *file = fopen(path, "r");
+    if (!file) {
+	perror(path);
+	exit(1);
+    }
+    Object *value= runFile(file, path);
+    fclose(file);
+    return value;
+}
+
+Object *prim_prim(int argc, Object **argv)
+{
+    printf("PRIM PRIM %d %p!\n", argc, argv);
+    while (argc-- > 0) println(*argv++, 1);
+    return nil;
+}
+
+Object *prim_import(int argc, Object **argv)
+{
+    Object *value = nil;
+    while (argc) {
+	Object *path = argv[--argc];
+	if (getType(path) != String) fatal("import requires string arguments");
+	value = runPath(get(path, String,value));
+    }
+    return value;
+}
+
+int main(int argc, char **argv)
+{
+    nil   = newObject(Undefined);
+    false = newInteger(0);
+    true  = newInteger(1);
+
+    breaks    = newArray();
+    continues = newArray();
+
+    intern("prim")  ->Symbol.value = newPrimitive(prim_prim  );
+    intern("import")->Symbol.value = newPrimitive(prim_import);
+
+    int nPaths = 0;
+    while (argc-- > 1) {
+	char *arg = *++argv;
+	if (!strcmp(arg, "-v")) ++opt_v;
+	else {
+	    runPath(arg);
+	    ++nPaths;
+	}
+    }
+
+    if (nPaths == 0) runFile(stdin, "<stdin>");
+
+    return 0;
+}

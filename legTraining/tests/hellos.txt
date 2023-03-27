@@ -1,0 +1,11 @@
+#!./16-complete
+
+x = 0;
+while (x < 10) {
+    import("16-hello.txt");
+    x = x + 1;
+}
+
+# the import() primitive should return the value of the last statement executed in the file
+
+print import("16-number.txt");
