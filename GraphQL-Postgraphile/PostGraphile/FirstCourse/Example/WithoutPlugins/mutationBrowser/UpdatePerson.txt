@@ -1,0 +1,9 @@
+mutation UpdatePerson {
+  updatePersonById(input: {id: 4, personPatch: {firstName: "Joey"}}) {
+    person {
+      id
+      firstName
+      lastName
+    }
+  }
+}

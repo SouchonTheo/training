@@ -1,0 +1,1 @@
+npm install @graphile-contrib/pg-simplify-inflector

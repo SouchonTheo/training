@@ -1,0 +1,9 @@
+query PeopleQuery {
+  people {
+    nodes {
+      id
+      firstName
+      lastName
+    }
+  }
+}

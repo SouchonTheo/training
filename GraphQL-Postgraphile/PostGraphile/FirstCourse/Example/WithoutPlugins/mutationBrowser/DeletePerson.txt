@@ -1,0 +1,8 @@
+mutation DeletePerson {
+  deletePersonById(input: {id: 5}) {
+    person {
+      id
+      firstName
+    }
+  }
+}
